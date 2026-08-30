@@ -73,6 +73,18 @@ def _vision_call(vision: Optional[GroqVisionExtractor], data: bytes, mime: str, 
         return f"[Visual extraction failed: {type(exc).__name__}]"
 
 
+def _shape_position(shape) -> str:
+    """Return safe PPTX shape coordinates without assuming they are always populated."""
+    left = getattr(shape, "left", None)
+    top = getattr(shape, "top", None)
+    if left is None or top is None:
+        return "position unavailable"
+    try:
+        return f"x={int(left)}, y={int(top)}"
+    except (TypeError, ValueError, OverflowError):
+        return "position unavailable"
+
+
 def _load_pdf(path: Path, source: str, file_hash: str, vision: Optional[GroqVisionExtractor], max_vision_items: int) -> List[Document]:
     pdf = fitz.open(str(path))
     docs: List[Document] = []
@@ -201,7 +213,7 @@ def _load_pptx(path: Path, source: str, file_hash: str, vision: Optional[GroqVis
                 text = shape.text.strip()
                 if text:
                     blocks.append(text)
-                    spatial.append(f"Text at x={int(shape.left)}, y={int(shape.top)}: {text}")
+                    spatial.append(f"Text at {_shape_position(shape)}: {text}")
             if getattr(shape, "has_table", False):
                 table_no += 1
                 rows = [[cell.text.strip() for cell in row.cells] for row in shape.table.rows]
@@ -383,7 +395,11 @@ def load_uploaded_files(
             tmp.write(data)
             tmp_path = Path(tmp.name)
         try:
-            all_docs.extend(_load_path(tmp_path, name, file_hash, vision, max_vision_items))
+            try:
+                extracted = _load_path(tmp_path, name, file_hash, vision, max_vision_items)
+            except Exception as exc:
+                raise ValueError(f"{name}: {type(exc).__name__}: {exc}") from exc
+            all_docs.extend(extracted)
         finally:
             tmp_path.unlink(missing_ok=True)
     return all_docs
