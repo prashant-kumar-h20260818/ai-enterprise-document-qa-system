@@ -84,6 +84,19 @@ class VectorStore:
             include=["documents", "metadatas", "distances"],
         )
 
+    def get_all_documents(self) -> Dict[str, Any]:
+        """Return the indexed text and metadata used by the lightweight lexical retriever.
+
+        Chroma/HNSW remains the dense semantic index. The returned corpus is cached by
+        ``RAGRetriever`` after indexing and is used only for a complementary TF-IDF
+        lexical signal. For very large production corpora, replace this with a proper
+        sparse index such as Elasticsearch/OpenSearch/BM25 rather than scanning the
+        complete collection in-process.
+        """
+        if self.count() == 0:
+            return {"ids": [], "documents": [], "metadatas": []}
+        return self.collection.get(include=["documents", "metadatas"])
+
     def list_sources(self) -> List[str]:
         if self.count() == 0:
             return []
