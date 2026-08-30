@@ -1,0 +1,4 @@
+question,expected_answer,expected_source,expected_page,expected_locator
+"What is the resignation date?","Replace with the gold answer from your document","resume.pdf",1,"page 1"
+"What value is shown in the revenue chart?","Replace with the gold answer from the visual","annual_report.pdf",,"page 7"
+"What is the total in the Sales sheet?","Replace with the gold answer from the spreadsheet","financials.xlsx",,"sheet Sales"
