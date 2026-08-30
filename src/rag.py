@@ -31,12 +31,80 @@ Rules:
 """
 
 
+class GroqFallbackLLM:
+    """Invoke the requested Groq model and fall back if that model is unavailable.
+
+    Model access can differ by Groq project/account. A model that exists in Groq's
+    catalog can still be unavailable to a specific key. We therefore retry only
+    model-availability failures and leave authentication/rate-limit/other errors
+    visible to the caller.
+    """
+
+    FALLBACK_MODELS = (
+        "openai/gpt-oss-20b",
+        "llama-3.1-8b-instant",
+        "openai/gpt-oss-120b",
+        "llama-3.3-70b-versatile",
+    )
+
+    def __init__(self, api_key: str, requested_model: str, temperature: float, max_tokens: int):
+        self.api_key = api_key
+        self.requested_model = requested_model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.last_model_used: str | None = None
+
+    def _client(self, model_name: str) -> ChatGroq:
+        return ChatGroq(
+            groq_api_key=self.api_key,
+            model_name=model_name,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+
+    @staticmethod
+    def _is_model_availability_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(
+            marker in text
+            for marker in (
+                "model_not_found",
+                "does not exist",
+                "do not have access",
+                "don't have access",
+                "model is not available",
+            )
+        )
+
+    def invoke(self, prompt: str):
+        candidates: List[str] = []
+        for model in (self.requested_model, *self.FALLBACK_MODELS):
+            if model and model not in candidates:
+                candidates.append(model)
+
+        last_error: Exception | None = None
+        for model in candidates:
+            try:
+                response = self._client(model).invoke(prompt)
+                self.last_model_used = model
+                return response
+            except Exception as exc:
+                last_error = exc
+                if not self._is_model_availability_error(exc):
+                    raise
+
+        raise RuntimeError(
+            "None of the configured Groq answer models are available for this API key/project. "
+            "Tried: " + ", ".join(candidates)
+        ) from last_error
+
+
 def create_llm(api_key: str, model_name: str, temperature: float = 0.1, max_tokens: int = 1024):
     if not api_key:
         raise ValueError("GROQ_API_KEY is required")
-    return ChatGroq(
-        groq_api_key=api_key,
-        model_name=model_name,
+    return GroqFallbackLLM(
+        api_key=api_key,
+        requested_model=model_name,
         temperature=temperature,
         max_tokens=max_tokens,
     )
@@ -123,6 +191,7 @@ ANSWER
                 "sources": [],
                 "context": "",
                 "max_retrieval_similarity": 0.0,
+                "model_used": None,
             }
 
         response = self.llm.invoke(prepared.prompt)
@@ -137,4 +206,5 @@ ANSWER
             "context": prepared.context,
             # Deliberately named retrieval similarity, not "answer confidence".
             "max_retrieval_similarity": float(max_similarity),
+            "model_used": getattr(self.llm, "last_model_used", None),
         }
