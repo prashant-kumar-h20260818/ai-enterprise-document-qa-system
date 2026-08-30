@@ -14,6 +14,7 @@ from src.embeddings import EmbeddingManager
 from src.evaluation import evaluate_dataset
 from src.loaders import SUPPORTED_EXTENSIONS, load_uploaded_files
 from src.rag import RAGPipeline, create_llm
+from src.rendering import split_display_math
 from src.retriever import RAGRetriever
 from src.vector_store import VectorStore
 
@@ -62,6 +63,19 @@ def get_pipeline(api_key: str, llm_model: str) -> RAGPipeline | None:
         return RAGPipeline(st.session_state.retriever, None)
     llm = create_llm(api_key, llm_model, CONFIG.temperature, CONFIG.max_tokens)
     return RAGPipeline(st.session_state.retriever, llm)
+
+
+def render_answer_content(content: str) -> None:
+    """Render assistant prose as Markdown and display equations with st.latex()."""
+    blocks = split_display_math(content)
+    if not blocks:
+        st.markdown(content)
+        return
+    for kind, block in blocks:
+        if kind == "latex":
+            st.latex(block)
+        else:
+            st.markdown(block)
 
 
 def render_sources(sources: list[dict]) -> None:
@@ -200,7 +214,10 @@ with chat_tab:
     # so the chat input below remains the final element in the conversation.
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            if message["role"] == "assistant":
+                render_answer_content(message["content"])
+            else:
+                st.markdown(message["content"])
             if message["role"] == "assistant":
                 if message.get("max_retrieval_similarity") is not None and message.get("sources"):
                     caption = (
