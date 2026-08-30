@@ -64,6 +64,25 @@ def get_pipeline(api_key: str, llm_model: str) -> RAGPipeline | None:
     return RAGPipeline(st.session_state.retriever, llm)
 
 
+def render_sources(sources: list[dict]) -> None:
+    if not sources:
+        return
+    with st.expander("Sources"):
+        for src in sources:
+            semantic = float(src.get("score", 0.0))
+            lexical = float(src.get("lexical_score", 0.0))
+            mode = str(src.get("retrieval_mode", "semantic"))
+            st.markdown(
+                f"**[{src['label']}] {src['source']}** — {src['locator']} — "
+                f"{src.get('content_type', 'text')}"
+            )
+            st.caption(
+                f"Retrieval: {mode} · semantic similarity {semantic:.3f} · "
+                f"lexical similarity {lexical:.3f}"
+            )
+            st.caption(src["preview"])
+
+
 init_state()
 embedding_manager = get_embedding_manager(CONFIG.embedding_model)
 
@@ -77,6 +96,7 @@ with st.sidebar:
     st.header("RAG configuration")
     st.write(f"**Embedding:** `{CONFIG.embedding_model}`")
     st.write(f"**Dimensions:** `{embedding_manager.dimension}`")
+    st.caption("Retrieval uses dense semantic search + lexical TF-IDF with reciprocal-rank fusion.")
 
     llm_model = st.text_input("Groq answer model", CONFIG.llm_model)
     vision_model = st.text_input("Groq vision model", secret_value("GROQ_VISION_MODEL", CONFIG.vision_model))
@@ -143,7 +163,7 @@ with chat_tab:
                 st.write("3/4 Creating normalized MiniLM embeddings")
                 vectors = embedding_manager.encode([c.page_content for c in chunks])
 
-                st.write("4/4 Upserting into ChromaDB (HNSW + cosine)")
+                st.write("4/4 Upserting into ChromaDB and building hybrid retriever")
                 store = VectorStore(collection_name(), CONFIG.persist_directory, reset_collection=True)
                 store.add_documents(chunks, vectors)
                 st.session_state.retriever = RAGRetriever(store, embedding_manager)
@@ -176,50 +196,62 @@ with chat_tab:
             for source in info["sources"]:
                 st.write("•", source)
 
+    # Always render completed history first. After each new answer we st.rerun(),
+    # so the chat input below remains the final element in the conversation.
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-            if message.get("sources"):
-                with st.expander("Sources"):
-                    for src in message["sources"]:
-                        st.markdown(
-                            f"**[{src['label']}] {src['source']}** — {src['locator']} — "
-                            f"{src.get('content_type', 'text')} — similarity `{src['score']:.3f}`"
-                        )
-                        st.caption(src["preview"])
+            if message["role"] == "assistant":
+                if message.get("max_retrieval_similarity") is not None and message.get("sources"):
+                    caption = (
+                        f"Max retrieval similarity: {float(message['max_retrieval_similarity']):.3f} "
+                        "(retrieval signal, not answer confidence)"
+                    )
+                    if message.get("model_used"):
+                        caption += f" · model: `{message['model_used']}`"
+                    st.caption(caption)
+                render_sources(message.get("sources", []))
 
-    question = st.chat_input("Ask a question about the indexed documents", disabled=not st.session_state.index_info)
+    question = st.chat_input(
+        "Ask a question about the indexed documents",
+        disabled=not st.session_state.index_info,
+    )
+
     if question:
         st.session_state.messages.append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.markdown(question)
-        with st.chat_message("assistant"):
-            if not api_key:
-                answer = "Add GROQ_API_KEY to generate an answer. Retrieval evaluation can still be run without generation."
-                output = {"answer": answer, "sources": [], "max_retrieval_similarity": 0.0}
-                st.warning(answer)
-            else:
-                try:
-                    pipeline = get_pipeline(api_key, llm_model)
-                    with st.spinner("Retrieving evidence and generating a grounded answer..."):
-                        output = pipeline.answer(question, top_k=top_k, score_threshold=threshold)
-                    st.markdown(output["answer"])
-                    if output["sources"]:
-                        st.caption(
-                            f"Max retrieval similarity: {output['max_retrieval_similarity']:.3f} "
-                            "(retrieval signal, not answer confidence)"
-                        )
-                        with st.expander("Sources"):
-                            for src in output["sources"]:
-                                st.markdown(
-                                    f"**[{src['label']}] {src['source']}** — {src['locator']} — "
-                                    f"{src.get('content_type', 'text')} — similarity `{src['score']:.3f}`"
-                                )
-                                st.caption(src["preview"])
-                except Exception as exc:
-                    output = {"answer": f"Request failed: {exc}", "sources": []}
-                    st.error(output["answer"])
-        st.session_state.messages.append({"role": "assistant", "content": output["answer"], "sources": output.get("sources", [])})
+
+        if not api_key:
+            output = {
+                "answer": "Add GROQ_API_KEY to generate an answer. Retrieval evaluation can still be run without generation.",
+                "sources": [],
+                "max_retrieval_similarity": 0.0,
+                "model_used": None,
+            }
+        else:
+            try:
+                pipeline = get_pipeline(api_key, llm_model)
+                with st.spinner("Retrieving evidence and generating a grounded answer..."):
+                    output = pipeline.answer(question, top_k=top_k, score_threshold=threshold)
+            except Exception as exc:
+                output = {
+                    "answer": f"Request failed: {exc}",
+                    "sources": [],
+                    "max_retrieval_similarity": 0.0,
+                    "model_used": None,
+                }
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": output["answer"],
+                "sources": output.get("sources", []),
+                "max_retrieval_similarity": output.get("max_retrieval_similarity"),
+                "model_used": output.get("model_used"),
+            }
+        )
+        # Critical UX fix: rerender the full conversation before drawing the next
+        # chat input, keeping the input below every completed Q&A turn.
+        st.rerun()
 
 with eval_tab:
     st.subheader("Measure RAG accuracy correctly")
@@ -268,7 +300,12 @@ Use separate benchmark slices for text, tables, charts, diagrams, scans and unan
                 for col, (name, value) in zip(cols, summary.items()):
                     col.metric(name.replace("_", " ").title(), f"{value:.3f}")
                 st.dataframe(results, use_container_width=True)
-                st.download_button("Download results", results.to_csv(index=False).encode(), "rag_evaluation_results.csv", "text/csv")
+                st.download_button(
+                    "Download results",
+                    results.to_csv(index=False).encode(),
+                    "rag_evaluation_results.csv",
+                    "text/csv",
+                )
             except Exception as exc:
                 st.error(f"Evaluation failed: {exc}")
 
@@ -287,20 +324,23 @@ RecursiveCharacterTextSplitter (default 1000 / 200)
         ↓
 all-MiniLM-L6-v2 → 384-d normalized embeddings
         ↓
-Persistent ChromaDB → HNSW cosine index
+Persistent ChromaDB → HNSW cosine dense index
+        +
+TF-IDF lexical index for exact words/acronyms/identifiers
         ↓
-Question → query embedding → Top-K + similarity threshold
+Question → dense + lexical retrieval → reciprocal-rank fusion → Top-K
         ↓
 Source-labeled retrieved context [S1], [S2], ...
         ↓
-Groq Llama 3.3 70B (temperature 0.1)
+Groq answer model with automatic model-access fallback (temperature 0.1)
         ↓
-Grounded answer + source citations
+Grounded Markdown/LaTeX answer + source citations
         ↓
-Streamlit UI + evaluation workflow""",
+Streamlit UI + layered RAG evaluation workflow""",
         language="text",
     )
     st.info(
         "For production: add SSO/tenant authorization, encrypted object storage, malware scanning, "
-        "background ingestion, audit logs, deletion policies, hybrid retrieval + reranking, and a curated regression benchmark."
+        "background ingestion, audit logs, deletion policies, a production BM25/sparse index, "
+        "cross-encoder reranking, and a curated regression benchmark."
     )
